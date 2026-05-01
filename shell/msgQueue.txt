@@ -1,0 +1,9 @@
+#ifndef __MSG_QUEUE_H__
+#define __MSG_QUEUE_H__
+
+#include <sys/ipc.h>
+#include <sys/msg.h>
+
+
+
+#endif
