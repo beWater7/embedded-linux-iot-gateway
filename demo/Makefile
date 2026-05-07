@@ -1,14 +1,6 @@
-ifndef PREFIX
-PREFIX  = arm-linux-gnueabihf-#工具链
-endif
+include toolchain.mk
 
-CC 	    = $(PREFIX)gcc
-CXX     = $(PREFIX)g++
-STRIP   = $(PREFIX)strip
-AR      = $(PREFIX)ar
-CFLAGS  += -g -Wall -std=gnu99 -Wno-missing-braces#-Werror
-#LDFLAGS += -lrt
-C_SRC = demo.c                    \
+C_SRC = demo.c                  \
         logMng/LogMng.c         \
 		node_tree/node_tree.c  
 

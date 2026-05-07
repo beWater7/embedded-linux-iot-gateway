@@ -1,6 +1,6 @@
 #!/bin/sh
 ### BEGIN INIT INFO
-# Provides:          LDY-gatWay project
+# Provides:          DY-gatWay project
 # Required-Start:
 # Required-Stop:
 # Default-Start:     

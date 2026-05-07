@@ -18,11 +18,17 @@
 #define EVENT     0x0003
 #define EXCEPTION 0x0004
 
-
 #define MINORTYPE 0x0020
 
+#ifndef PATH_MAX
+#define PATH_MAX  1024
+#endif
+
+#define MAX_LOG_ITEMS_PER_FILE 10
+
+
 //#define LOG_FOLDER "/home/liudayi/code/learn-test/LogFolder"
-#define LOG_FOLDER "/tmp/LogFolder"
+#define LOG_FOLDER "/home/root/LogFolder"
 /* 会自动生成在/dev/mqueue/ 路径下
  * queue的取名非常重要, 取名log_queue时一直无法设置属性，队列一直是满的
  */

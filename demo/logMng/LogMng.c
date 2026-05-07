@@ -45,7 +45,8 @@ int initLogMng(void)
     int file_count = 0;
     int fd = -1;
     LOG_NODE *log_node = NULL;
-    char tmpBuff[sizeof(LOG_FILE_INFO) + 1] = {0};
+    int ret = 0;
+
 #if defined(USE_POSIX_MQ)
     mqd_t mq;
     struct mq_attr attr = {0};
@@ -57,6 +58,7 @@ int initLogMng(void)
     memset(&gs_log_mng_t, 0, sizeof(LOG_MNG_T));
     gs_log_mng_t.logFileInfo.logFilefd = -1;
     lstInit(&gs_log_mng_t.logFileList);
+
     if (pthread_mutex_init(&gs_log_mng_t.logMngMutex, NULL) != 0) 
     {
         perror("Mutex initialization failed");
@@ -68,7 +70,8 @@ int initLogMng(void)
     if (-1 == gs_log_mng_t.MsgQid) 
     {
         perror("msgget");
-        return -1;
+        ret = -1;
+        goto cleanup;
     }
 #endif
 #if 1
@@ -112,145 +115,168 @@ int initLogMng(void)
     {
         if (errno == ENOENT)
         {
-            // 目录不存在，创建
-            if (mkdir(LOG_FOLDER, 0755) == -1)
+            if (mkdir(LOG_FOLDER, 0755) == -1 && errno != EEXIST)
             {
                 perror("mkdir");
-                return -1;
+                ret = -1;
+                goto cleanup;
             }
 
-            // 创建完再打开
             dir = opendir(LOG_FOLDER);
             if (dir == NULL)
             {
                 perror("opendir after mkdir");
-                return -1;
+                ret = -1;
+                goto cleanup;
             }
         }
         else
         {
             // 其他错误，比如权限问题
             perror("opendir");
-            return -1;
+            ret = -1;
+            goto cleanup;
         }
     }
 
+    /* 遍历日志文件 */
     while ((entry = readdir(dir)) != NULL) 
     {
-        char fullpath[1024];
-        snprintf(fullpath, sizeof(fullpath), "%s/%s", LOG_FOLDER, entry->d_name);
-
-        if (stat(fullpath, &info) == -1) 
+        char fullpath[PATH_MAX];
+        
+        // ✅ 安全的路径拼接
+        if (snprintf(fullpath, sizeof(fullpath), "%s/%s", LOG_FOLDER, entry->d_name) >= sizeof(fullpath))
         {
-            perror("stat");  // 打印出错信息
+            fprintf(stderr, "Path too long: %s/%s\n", LOG_FOLDER, entry->d_name);
             continue;
         }
 
-        if (S_ISDIR(info.st_mode)) 
+        if (stat(fullpath, &info) == -1) 
         {
-            // 目录
-            if (strcmp(entry->d_name, ".") != 0 && strcmp(entry->d_name, "..") != 0) 
+            perror("stat");
+            continue;
+        }
+
+        if (S_ISREG(info.st_mode)) 
+        {
+            char **temp = realloc(files, (file_count + 1) * sizeof(char *));
+            if (!temp)
             {
-                printf("Directory: %s\n", fullpath);
-                //traverseDirectory(fullpath);  // 递归调用以遍历子目录 ---暂不支持
+                perror("realloc");
+                ret = -1;
+                goto cleanup;
             }
-        } 
-        else if (S_ISREG(info.st_mode)) 
-        {
-            /* 普通日志文件, 遍历结果显示并不是理想中的顺序, 因此需要对文件进行排序 */
-            //printf("File: %s\n", fullpath);
-            files = realloc(files, (file_count + 1) * sizeof(char *));
+            files = temp;
+            
             files[file_count] = strdup(entry->d_name);
-            file_count++;          
+            if (!files[file_count])
+            {
+                perror("strdup");
+                ret = -1;
+                goto cleanup;
+            }
+            file_count++;
         }
     }
 
-    /* 排序文件名、标准库实现的快速排序算法 */
+    /* 排序文件 */
     qsort(files, file_count, sizeof(char *), compare);
 
-    // 打印排序后的文件名
+    // 只初始化一次，不要在循环中累加
+    gs_log_mng_t.logFileNum = 0;
+    gs_log_mng_t.logFileInfo.seq = 0;
+
+    /* 构建文件链表 */
     for (int i = 0; i < file_count; i++) 
-    {    
+    {
         log_node = (LOG_NODE*)malloc(sizeof(LOG_NODE));
-        memcpy(log_node->fileName, files[i], NAME_MAX_LEN);
+        if (!log_node)
+        {
+            perror("malloc");
+            ret = -1;
+            goto cleanup;
+        }
+        
+        //  正确的memset大小
+        memset(log_node, 0, sizeof(LOG_NODE));
+        
+        //  安全的字符串拷贝
+        strncpy(log_node->fileName, files[i], NAME_MAX_LEN - 1);
+        log_node->fileName[NAME_MAX_LEN - 1] = '\0';
+        
         pthread_mutex_lock(&gs_log_mng_t.logMngMutex);
-        /* 将文件节点加入到管理链表 */
         lstAddTail(&gs_log_mng_t.logFileList, &log_node->node);
         gs_log_mng_t.logFileNum++;
-        gs_log_mng_t.logFileInfo.seq++;
         pthread_mutex_unlock(&gs_log_mng_t.logMngMutex);
-        printf("Sorted File: %s\n", files[i]);
-        free(files[i]);  // 释放内存
+
+        //printf("Sorted File: %s\n", files[i]);
     }
 
-    /* 直接找到最后一个日志文件*/
-    if(0 == lstLength(&gs_log_mng_t.logFileList))
+    // seq应该是下一个文件编号
+    gs_log_mng_t.logFileInfo.seq = file_count;
+
+    /* 打开最后一个日志文件 */
+    if (lstLength(&gs_log_mng_t.logFileList) > 0)
     {
-        printf("logFileList is NULL!\n");
+        log_node = (LOG_NODE *)lstLast(&gs_log_mng_t.logFileList);
+        
+        char dstFileName[PATH_MAX];
+        // 安全的路径构建
+        if (snprintf(dstFileName, sizeof(dstFileName), "%s/%s", 
+                    LOG_FOLDER, log_node->fileName) >= sizeof(dstFileName))
+        {
+            fprintf(stderr, "Path too long\n");
+            ret = -1;
+            goto cleanup;
+        }
 
-        pthread_mutex_lock(&mutex);
-        thread_initialized = 1;
-        pthread_cond_signal(&cond);
-        pthread_mutex_unlock(&mutex);
+        fd = open(dstFileName, O_RDWR);
+        if (fd < 0)
+        {
+            perror("open");
+            ret = -1;
+            goto cleanup;
+        }
 
-        //close(gs_log_mng_t.logFileInfo.logFilefd);
-        return 0;
-    }
-    
-    log_node = (LOG_NODE *)lstLast(&gs_log_mng_t.logFileList);
-    strncpy(gs_log_mng_t.logFileInfo.fileName, log_node->fileName, NAME_MAX_LEN);
-    char dstFileName[128] = {0};
-    /* 获取文件完整路径 */
-    strncpy(dstFileName, LOG_FOLDER, strlen(LOG_FOLDER));
-    dstFileName[strlen(LOG_FOLDER)] = '/';
-    strcat(dstFileName,log_node->fileName);
-    dstFileName[strlen(LOG_FOLDER) +  strlen(log_node->fileName) + 1] = '\0';
-    //printf("lastestFileName = %s\n", dstFileName);
+        pthread_mutex_lock(&gs_log_mng_t.logMngMutex);
+        gs_log_mng_t.logFileInfo.logFilefd = fd;
+        
+        // 读取文件头
+        ssize_t n = read(fd, &gs_log_mng_t.logFileInfo.logHead, sizeof(LOG_HEAD_INFO));
+        if (n != sizeof(LOG_HEAD_INFO))
+        {
+            fprintf(stderr, "Failed to read log header\n");
+            pthread_mutex_unlock(&gs_log_mng_t.logMngMutex);
+            ret = -1;
+            goto cleanup;
+        }
 
-    fd = open(dstFileName, O_RDWR);
-    if (-1 == fd)
-    {
-        perror("open");
-        return -1;
-    }
-    /* 获取文件信息 */
-    if (fstat(fd, &info) == -1) {
-        perror("fstat");
-        close(fd);
-        return -1;
-    }
-
-    pthread_mutex_lock(&gs_log_mng_t.logMngMutex);
-    gs_log_mng_t.logFileInfo.logFilefd = fd;
-    ssize_t bytesRead = 0;
-    ssize_t totalBytesRead = 0;
-
-    // 循环读取文件头信息
-    while ((bytesRead = read(fd, tmpBuff + totalBytesRead, sizeof(LOG_HEAD_INFO) - totalBytesRead)) > 0) 
-    {
-        totalBytesRead += bytesRead;
     }
 
-    if(totalBytesRead != sizeof(LOG_HEAD_INFO))
-    {
-        printf("read file head failed!\n");
-        pthread_mutex_unlock(&gs_log_mng_t.logMngMutex);
-        return -1;
-    }
-    tmpBuff[sizeof(LOG_HEAD_INFO)+1] = '\0';
-    memcpy(&gs_log_mng_t.logFileInfo.logHead, tmpBuff, sizeof(LOG_HEAD_INFO));
-    printf("logHead.logItemNum:%d\n",gs_log_mng_t.logFileInfo.logHead.logItemNum);
     pthread_mutex_unlock(&gs_log_mng_t.logMngMutex);
+
+cleanup:
+    /* 清理资源 */
+    if (files)
+    {
+        for (int i = 0; i < file_count; i++)
+        {
+            free(files[i]);
+        }
+        free(files);  //不要忘记释放数组本身
+    }
+
+    if (dir)
+    {
+        closedir(dir);
+    }
 
     pthread_mutex_lock(&mutex);
     thread_initialized = 1;
     pthread_cond_signal(&cond);
     pthread_mutex_unlock(&mutex);
 
-    //close(fd);
-    closedir(dir);
-
-    return 0;
+    return ret;
 }
 
 
@@ -274,16 +300,9 @@ int writeLogApi(LOG_WRITE_PARAM *log_write_param, char *data, int dataLen)
     log_item.info_len = dataLen;
     memcpy(log_item.info, data, dataLen);
 
-    int msgid = msgget(KEY, IPC_CREAT | 0666);
-    if (msgid == -1)
-    {
-        perror("msgget");
-        return -1;
-    }
-
     msg.mtype = 1;
     msg.data  = log_item;
-    if (msgsnd(msgid, &msg, sizeof(LOG_ITEM), IPC_NOWAIT) == -1)
+    if (msgsnd(gs_log_mng_t.MsgQid, &msg, sizeof(LOG_ITEM), IPC_NOWAIT) == -1)
     {
         if (errno == EAGAIN)
         {
@@ -314,12 +333,14 @@ int writeLogApi(LOG_WRITE_PARAM *log_write_param, char *data, int dataLen)
         {
             // 消息队列已满，处理相应逻辑
             printf("Message queue is full.\n");
+            mq_close(mq);
             return -1;
         } 
         else 
         {
             perror("mq_send");
             printf("------------------------------------\n");
+            mq_close(mq);
             return -1;
         }
     }
@@ -329,11 +350,11 @@ int writeLogApi(LOG_WRITE_PARAM *log_write_param, char *data, int dataLen)
     return 0;
 }
 
-
+#if 0
 int writeLog(LOG_WRITE_PARAM *log_write_param, char *data, int dataLen)
 {
     char filename[64] = {0};
-    static LOG_HEAD_INFO headInfo = {0};
+    LOG_HEAD_INFO headInfo = {0};
     LOG_ITEM_NODE node = {0};
 
     waitModuleInited();
@@ -350,7 +371,7 @@ int writeLog(LOG_WRITE_PARAM *log_write_param, char *data, int dataLen)
     memcpy(&headInfo, &gs_log_mng_t.logFileInfo.logHead, sizeof(LOG_HEAD_INFO));
 
     /* 当前没有日志文件 或者当前日志文件已经写满 */
-    if(0 == gs_log_mng_t.logFileNum || 10 == gs_log_mng_t.logFileInfo.logHead.logItemNum)
+    if(0 == gs_log_mng_t.logFileNum || MAX_LOG_ITEMS_PER_FILE == gs_log_mng_t.logFileInfo.logHead.logItemNum)
     {
         /* 上一个日志文件已满，关闭文件描述符 */
         if(gs_log_mng_t.logFileInfo.logFilefd > 0)
@@ -371,7 +392,7 @@ int writeLog(LOG_WRITE_PARAM *log_write_param, char *data, int dataLen)
         printf("new file:%s\r\n", filename);
 
         /*创建新的日志文件*/
-        gs_log_mng_t.logFileInfo.logFilefd = open(filename, O_CREAT | O_RDWR | O_TRUNC /*| O_APPEND*/, 0600);
+        gs_log_mng_t.logFileInfo.logFilefd = open(filename, O_CREAT | O_RDWR/* | O_APPEND*/, 0600);
         if(gs_log_mng_t.logFileInfo.logFilefd < 0)
         {
             pthread_mutex_unlock(&gs_log_mng_t.logMngMutex);
@@ -427,6 +448,7 @@ int writeLog(LOG_WRITE_PARAM *log_write_param, char *data, int dataLen)
     memcpy(node.log_item.info, data, LOG_ITEM_LEN-20);
 
     /* 向日志文件写入日志条目信息 */
+    //lseek(gs_log_mng_t.logFileInfo.logFilefd, gs_log_mng_t.logFileInfo.logHead.fileWriteSeq, SEEK_SET);
     lseek(gs_log_mng_t.logFileInfo.logFilefd, headInfo.fileWriteSeq, SEEK_SET);
     write(gs_log_mng_t.logFileInfo.logFilefd, &node.log_item, sizeof(LOG_ITEM));
     fsync(gs_log_mng_t.logFileInfo.logFilefd);
@@ -454,6 +476,145 @@ int writeLog(LOG_WRITE_PARAM *log_write_param, char *data, int dataLen)
 
     //printf("fd:%d\n",gs_log_mng_t.logFileInfo.logFilefd);
     return 0;
+}
+#endif
+int writeLog(LOG_WRITE_PARAM *log_write_param, char *data, int dataLen)
+{
+    char filename[PATH_MAX] = {0};
+    LOG_HEAD_INFO headInfo = {0};
+    LOG_ITEM_NODE node = {0};
+    int ret = 0;
+
+    waitModuleInited();
+
+    /* 参数检查 */
+    if (!log_write_param || !data || dataLen <= 0)
+    {
+        return -1;
+    }
+
+    pthread_mutex_lock(&gs_log_mng_t.logMngMutex);
+
+    #if LOG_DEBUG_EN
+    // 👉 添加调试输出
+    printf("=== writeLog Debug ===\n");
+    printf("logFileNum: %d\n", gs_log_mng_t.logFileNum);
+    printf("logFilefd: %d\n", gs_log_mng_t.logFileInfo.logFilefd);
+    printf("logItemNum (global): %d\n", gs_log_mng_t.logFileInfo.logItemNum);
+    printf("logItemNum (head): %d\n", gs_log_mng_t.logFileInfo.logHead.logItemNum);
+    printf("current filename: %s\n", gs_log_mng_t.logFileInfo.fileName);
+    printf("seq: %d\n", gs_log_mng_t.logFileInfo.seq);
+    printf("====================\n");
+    #endif
+
+    /* 拷贝当前文件头 */
+    memcpy(&headInfo, &gs_log_mng_t.logFileInfo.logHead, sizeof(LOG_HEAD_INFO));
+
+    /* 需要创建新文件 */
+    if (0 == gs_log_mng_t.logFileNum || headInfo.logItemNum >= MAX_LOG_ITEMS_PER_FILE)
+    {
+        /* 关闭旧文件 */
+        if (gs_log_mng_t.logFileInfo.logFilefd > 0)
+        {
+            close(gs_log_mng_t.logFileInfo.logFilefd);
+            gs_log_mng_t.logFileInfo.logFilefd = -1;
+        }
+
+        /* 构建新文件名 */
+        if (snprintf(filename, sizeof(filename), "%s/log%03d",
+                    LOG_FOLDER, gs_log_mng_t.logFileInfo.seq) >= sizeof(filename))
+        {
+            fprintf(stderr, "Filename too long\n");
+            ret = -1;
+            goto unlock;
+        }
+
+        printf("Creating new file: %s\n", filename);
+
+        /* 创建新文件 */
+        gs_log_mng_t.logFileInfo.logFilefd = open(filename, O_CREAT | O_RDWR, 0600);
+        if (gs_log_mng_t.logFileInfo.logFilefd < 0)
+        {
+            perror("open");
+            ret = -1;
+            goto unlock;
+        }
+
+        /* 初始化文件头 */
+        memset(&headInfo, 0, sizeof(LOG_HEAD_INFO));
+        headInfo.startTime = log_write_param->time;
+        headInfo.fileWriteSeq = sizeof(LOG_HEAD_INFO);
+
+        /* 写入文件头 */
+        if (write(gs_log_mng_t.logFileInfo.logFilefd, &headInfo, sizeof(LOG_HEAD_INFO)) != sizeof(LOG_HEAD_INFO))
+        {
+            perror("write header");
+            close(gs_log_mng_t.logFileInfo.logFilefd);
+            gs_log_mng_t.logFileInfo.logFilefd = -1;
+            ret = -1;
+            goto unlock;
+        }
+        fsync(gs_log_mng_t.logFileInfo.logFilefd);
+
+        /* 更新全局状态 */
+        gs_log_mng_t.logFileNum++;
+        gs_log_mng_t.logFileInfo.seq++;
+        gs_log_mng_t.logFileInfo.logItemNum = 0;
+    }
+
+    /* 准备日志条目 */
+    node.log_item.time = log_write_param->time;
+    node.log_item.major = log_write_param->major;
+    node.log_item.minor = log_write_param->minor;
+    
+    //安全的拷贝
+    int copy_len = dataLen > (sizeof(node.log_item.info) - 1) ? (sizeof(node.log_item.info) - 1) : dataLen;
+    memcpy(node.log_item.info, data, copy_len);
+    node.log_item.info[copy_len] = '\0';
+
+    /* 写入日志条目 */
+    if (lseek(gs_log_mng_t.logFileInfo.logFilefd, headInfo.fileWriteSeq, SEEK_SET) == -1)
+    {
+        perror("lseek");
+        ret = -1;
+        goto unlock;
+    }
+    
+    if (write(gs_log_mng_t.logFileInfo.logFilefd, &node.log_item, sizeof(LOG_ITEM)) != sizeof(LOG_ITEM))
+    {
+        perror("write log item");
+        ret = -1;
+        goto unlock;
+    }
+    fsync(gs_log_mng_t.logFileInfo.logFilefd);
+
+    /* 更新文件头 */
+    headInfo.endTime = log_write_param->time;
+    headInfo.logItemNum++;
+    headInfo.fileWriteSeq += sizeof(LOG_ITEM);
+
+    /* 重写文件头 */
+    if (lseek(gs_log_mng_t.logFileInfo.logFilefd, 0, SEEK_SET) == -1)
+    {
+        perror("lseek");
+        ret = -1;
+        goto unlock;
+    }
+    
+    if (write(gs_log_mng_t.logFileInfo.logFilefd, &headInfo, sizeof(LOG_HEAD_INFO)) != sizeof(LOG_HEAD_INFO))
+    {
+        perror("write header update");
+        ret = -1;
+        goto unlock;
+    }
+
+    /* 更新内存中的文件头 */
+    memcpy(&gs_log_mng_t.logFileInfo.logHead, &headInfo, sizeof(LOG_HEAD_INFO));
+    gs_log_mng_t.logFileInfo.logItemNum++;
+
+unlock:
+    pthread_mutex_unlock(&gs_log_mng_t.logMngMutex);
+    return ret;
 }
 
 
