@@ -1,0 +1,12 @@
+{
+    "files.associations": {
+        "time.h": "c",
+        "cmath": "c",
+        "chrono": "cpp",
+        "functional": "cpp",
+        "thread": "c",
+        "deque": "c",
+        "string": "c",
+        "vector": "c"
+    }
+}
